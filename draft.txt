@@ -1,0 +1,489 @@
+// main.cpp
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <imgui/imgui.h>
+#include <imgui/backends/imgui_impl_glfw.h>
+#include <imgui/backends/imgui_impl_opengl3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <vector>
+#include <stack>
+#include <random>
+#include <iostream>
+#include <queue>
+#include <functional>
+#include <tuple>
+#include <algorithm>
+#include <set>
+
+static const int COLS = 20;
+static const int ROWS = 20;
+static GLFWwindow* gWindow = nullptr;
+
+// keep a centered square viewport
+void framebuffer_size_callback(GLFWwindow*, int width, int height) {
+    int sz   = std::min(width, height);
+    int xoff = (width  - sz) / 2;
+    int yoff = (height - sz) / 2;
+    glViewport(xoff, yoff, sz, sz);
+}
+
+struct Cell {
+    bool visited = false;
+    bool walls[4] = { true, true, true, true }; // top, right, bottom, left
+};
+
+std::vector<Cell> grid;
+std::vector<float> wallVertices;
+unsigned int wallVAO, wallVBO, borderVAO, borderVBO;
+
+// solver state
+static bool solving       = false;
+static int  animState     = 0;              // 0=running, 1=done
+static double animStartTime = 0, animEndTime = 0;
+static int  solveAlgo     = 0;              // 0=DFS, 1=BFS
+
+static std::vector<std::tuple<int,int,bool>> events;
+static std::vector<std::pair<int,int>>       finalPathEdges;
+static std::vector<float>                   successVertices;
+static std::vector<float>                   failureVertices;
+static size_t                               eventIndex = 0;
+
+unsigned int successVAO, successVBO, failureVAO, failureVBO;
+int startCell, endCell;
+std::mt19937 rng(std::random_device{}());
+
+// grid helpers
+inline int index(int x, int y) {
+    if (x<0 || y<0 || x>=COLS || y>=ROWS) return -1;
+    return x + y*COLS;
+}
+std::vector<int> getUnvisitedNeighbors(int x, int y) {
+    static const int dirs[4][3] = {{0,-1,0},{1,0,1},{0,1,2},{-1,0,3}};
+    std::vector<int> nbrs;
+    for (auto &d: dirs) {
+        int ni = index(x + d[0], y + d[1]);
+        if (ni != -1 && !grid[ni].visited)
+            nbrs.push_back((d[2]<<16) | ni);
+    }
+    return nbrs;
+}
+void removeWalls(int a, int b, int w) {
+    grid[a].walls[w]       = false;
+    grid[b].walls[(w+2)%4] = false;
+}
+
+// Maze generation
+void generateMaze() {
+    grid.assign(COLS*ROWS, Cell());
+    std::stack<int> st;
+    int visitedCount = 1, total = COLS*ROWS, current = 0;
+    grid[0].visited = true;
+    while (visitedCount < total) {
+        int cx = current % COLS, cy = current / COLS;
+        auto nbrs = getUnvisitedNeighbors(cx, cy);
+        if (!nbrs.empty()) {
+            std::uniform_int_distribution<int> di(0, (int)nbrs.size() - 1);
+            int packed = nbrs[di(rng)];
+            int w = packed >> 16, nxt = packed & 0xFFFF;
+            st.push(current);
+            removeWalls(current, nxt, w);
+            current = nxt;
+            grid[current].visited = true;
+            visitedCount++;
+        } else if (!st.empty()) {
+            current = st.top(); st.pop();
+        }
+    }
+    // pick start/end among corners + center
+    std::vector<int> cand = {
+        index(0,0),
+        index(COLS-1,0),
+        index(0,ROWS-1),
+        index(COLS-1,ROWS-1),
+        index(COLS/2,ROWS/2)
+    };
+    std::uniform_int_distribution<int> dc(0, (int)cand.size() - 1);
+    startCell = cand[dc(rng)];
+    do { endCell = cand[dc(rng)]; }
+    while (endCell == startCell);
+}
+
+// Build wall vertices
+void buildWallVertices() {
+    wallVertices.clear();
+    for (int y = 0; y < ROWS; y++) {
+        for (int x = 0; x < COLS; x++) {
+            int i = index(x, y);
+            float xf = (float)x, yf = (float)y;
+            if (grid[i].walls[0]) wallVertices.insert(wallVertices.end(), {xf, yf, xf+1, yf});
+            if (grid[i].walls[1]) wallVertices.insert(wallVertices.end(), {xf+1, yf, xf+1, yf+1});
+            if (grid[i].walls[2]) wallVertices.insert(wallVertices.end(), {xf+1, yf+1, xf, yf+1});
+            if (grid[i].walls[3]) wallVertices.insert(wallVertices.end(), {xf, yf+1, xf, yf});
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, wallVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+                 wallVertices.size() * sizeof(float),
+                 wallVertices.data(),
+                 GL_STATIC_DRAW);
+}
+
+// Shader helpers
+unsigned int compileShader(unsigned int type, const char* src) {
+    unsigned int id = glCreateShader(type);
+    glShaderSource(id, 1, &src, nullptr);
+    glCompileShader(id);
+    int ok; glGetShaderiv(id, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char buf[512];
+        glGetShaderInfoLog(id,512,nullptr,buf);
+        std::cerr<<"Shader error:\n"<<buf<<"\n";
+    }
+    return id;
+}
+unsigned int createProgram() {
+    const char* vs =
+      "#version 330 core\n"
+      "layout(location=0) in vec2 aPos;\n"
+      "uniform mat4 uProjection;\n"
+      "void main(){ gl_Position = uProjection * vec4(aPos,0,1); }\n";
+    const char* fs =
+      "#version 330 core\n"
+      "out vec4 FragColor;\n"
+      "uniform vec3 uColor;\n"
+      "void main(){ FragColor = vec4(uColor,1); }\n";
+    unsigned int prog = glCreateProgram();
+    unsigned int v = compileShader(GL_VERTEX_SHADER, vs);
+    unsigned int f = compileShader(GL_FRAGMENT_SHADER, fs);
+    glAttachShader(prog, v);
+    glAttachShader(prog, f);
+    glLinkProgram(prog);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    return prog;
+}
+
+// DFS solver
+void solveDFS() {
+    int N = COLS*ROWS;
+    std::vector<bool> vis(N,false);
+    events.clear();
+
+    std::function<bool(int)> dfsRec = [&](int u) {
+        if (u == endCell) return true;
+        int x = u % COLS, y = u / COLS;
+        static const int dirs[4][3] = {{0,-1,0},{1,0,1},{0,1,2},{-1,0,3}};
+        for (auto &d : dirs) {
+            int v = index(x + d[0], y + d[1]);
+            if (v < 0 || grid[u].walls[d[2]] || vis[v]) continue;
+            vis[v] = true;
+            events.emplace_back(u, v, true);
+            if (dfsRec(v)) return true;
+            events.emplace_back(u, v, false);
+        }
+        return false;
+    };
+
+    vis[startCell] = true;
+    dfsRec(startCell);
+}
+
+// BFS solver
+void solveBFS() {
+    int N = COLS*ROWS;
+    std::vector<bool> vis(N,false);
+    std::vector<int>  parent(N,-1);
+    std::queue<int>   q;
+    events.clear();
+    finalPathEdges.clear();
+
+    vis[startCell] = true;
+    q.push(startCell);
+    static const int dirs[4][3] = {{0,-1,0},{1,0,1},{0,1,2},{-1,0,3}};
+
+    while (!q.empty()) {
+        int u = q.front(); q.pop();
+        if (u == endCell) break;
+        int x = u % COLS, y = u / COLS;
+        for (auto &d : dirs) {
+            int v = index(x + d[0], y + d[1]);
+            if (v<0 || grid[u].walls[d[2]] || vis[v]) continue;
+            events.emplace_back(u, v, false);
+            vis[v] = true;
+            parent[v] = u;
+            q.push(v);
+        }
+    }
+
+    // back‑track path
+    int cur = endCell;
+    while (cur != -1) {
+        int p = parent[cur];
+        if (p == -1) break;
+        finalPathEdges.emplace_back(p, cur);
+        cur = p;
+    }
+    std::reverse(finalPathEdges.begin(), finalPathEdges.end());
+
+    std::set<std::pair<int,int>> pathSet(finalPathEdges.begin(), finalPathEdges.end());
+    for (auto &e : events) {
+        int u = std::get<0>(e), v = std::get<1>(e);
+        if (pathSet.count({u,v})) std::get<2>(e) = true;
+    }
+}
+
+int main() {
+    // GLFW + GLAD init
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_SAMPLES,4);
+    gWindow = glfwCreateWindow(800,800,"Maze-Runner",nullptr,nullptr);
+    glfwMakeContextCurrent(gWindow);
+    gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
+    glfwSetFramebufferSizeCallback(gWindow,framebuffer_size_callback);
+
+    // smoothing & blending
+    glEnable(GL_MULTISAMPLE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+
+    // ImGui init & style
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui_ImplGlfw_InitForOpenGL(gWindow,true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+    ImGui::StyleColorsDark();
+    ImVec4* colors = ImGui::GetStyle().Colors;
+    colors[ImGuiCol_WindowBg]      = ImVec4(0.10f,0.10f,0.15f,0.95f);
+    colors[ImGuiCol_Header]        = ImVec4(0.25f,0.20f,0.35f,0.80f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.30f,0.25f,0.45f,0.80f);
+    colors[ImGuiCol_Button]        = ImVec4(0.40f,0.35f,0.55f,0.80f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.50f,0.45f,0.65f,0.90f);
+
+    // initial maze
+    generateMaze();
+
+    // VAO/VBO setup — walls
+    glGenVertexArrays(1,&wallVAO);
+    glGenBuffers(1,&wallVBO);
+    glBindVertexArray(wallVAO);
+    glBindBuffer(GL_ARRAY_BUFFER,wallVBO);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
+    glEnableVertexAttribArray(0);
+
+    // border
+    std::vector<float> borderVertices = {
+        0.0f,0.0f,
+        (float)COLS,0.0f,
+        (float)COLS,(float)ROWS,
+        0.0f,(float)ROWS
+    };
+    glGenVertexArrays(1,&borderVAO);
+    glGenBuffers(1,&borderVBO);
+    glBindVertexArray(borderVAO);
+    glBindBuffer(GL_ARRAY_BUFFER,borderVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+                 borderVertices.size()*sizeof(float),
+                 borderVertices.data(),
+                 GL_STATIC_DRAW);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
+    glEnableVertexAttribArray(0);
+
+    // success/failure VAOs
+    glGenVertexArrays(1,&failureVAO);
+    glGenBuffers(1,&failureVBO);
+    glBindVertexArray(failureVAO);
+    glBindBuffer(GL_ARRAY_BUFFER,failureVBO);
+    glBufferData(GL_ARRAY_BUFFER,0,nullptr,GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
+    glEnableVertexAttribArray(0);
+
+    glGenVertexArrays(1,&successVAO);
+    glGenBuffers(1,&successVBO);
+    glBindVertexArray(successVAO);
+    glBindBuffer(GL_ARRAY_BUFFER,successVBO);
+    glBufferData(GL_ARRAY_BUFFER,0,nullptr,GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
+    glEnableVertexAttribArray(0);
+
+    // shader & projection
+    unsigned int shader = createProgram();
+    glm::mat4 proj = glm::ortho(0.0f,(float)COLS,(float)ROWS,0.0f);
+    glUseProgram(shader);
+    glUniformMatrix4fv(glGetUniformLocation(shader,"uProjection"),
+                       1,GL_FALSE,&proj[0][0]);
+
+    // animation timing
+    const double baseDelay = 0.005;
+    double lastEventTime = 0.0;
+    float speedMultiplier = 1.0f;
+
+    buildWallVertices();
+
+    while (!glfwWindowShouldClose(gWindow)) {
+        glfwPollEvents();
+        glClearColor(0.05f,0.05f,0.10f,1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        // draw walls
+        glLineWidth(1.5f);
+        glUniform3f(glGetUniformLocation(shader,"uColor"),
+                    0.60f,0.40f,0.80f);
+        glBindVertexArray(wallVAO);
+        glDrawArrays(GL_LINES,0,(int)wallVertices.size()/2);
+
+        // draw border
+        glUniform3f(glGetUniformLocation(shader,"uColor"),
+                    1.00f,0.50f,0.70f);
+        glBindVertexArray(borderVAO);
+        glLineWidth(2.0f);
+        glDrawArrays(GL_LINE_LOOP,0,4);
+
+        // animate solver
+        if (solving && animState == 0) {
+            double ct = glfwGetTime();
+            while (eventIndex < events.size() &&
+                   (ct - lastEventTime) >= (baseDelay / speedMultiplier))
+            {
+                auto [u,v,ok] = events[eventIndex++];
+                float ux = (u%COLS)+0.5f, uy = (u/COLS)+0.5f;
+                float vx = (v%COLS)+0.5f, vy = (v/COLS)+0.5f;
+
+                if (ok) {
+                    successVertices.insert(successVertices.end(), {ux,uy,vx,vy});
+                } else {
+                    if (solveAlgo == 0 && successVertices.size() >= 4) {
+                        successVertices.erase(successVertices.end()-4, successVertices.end());
+                    }
+                    failureVertices.insert(failureVertices.end(), {ux,uy,vx,vy});
+                }
+                lastEventTime += (baseDelay / speedMultiplier);
+                ct = glfwGetTime();
+            }
+            if (eventIndex >= events.size()) {
+                animState = 1;
+                animEndTime = glfwGetTime();
+                solving = false;
+            }
+        }
+
+        // draw success path
+        glLineWidth(2.5f);
+        glUniform3f(glGetUniformLocation(shader,"uColor"),
+                    0.50f,1.00f,0.50f);
+        glBindVertexArray(successVAO);
+        glBindBuffer(GL_ARRAY_BUFFER,successVBO);
+        glBufferData(GL_ARRAY_BUFFER,
+                     successVertices.size()*sizeof(float),
+                     successVertices.data(),
+                     GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_LINES,0,(int)successVertices.size()/2);
+
+        // draw failure/backtrack
+        glLineWidth(1.5f);
+        glUniform3f(glGetUniformLocation(shader,"uColor"),
+                    1.00f,0.60f,0.60f);
+        glBindVertexArray(failureVAO);
+        glBindBuffer(GL_ARRAY_BUFFER,failureVBO);
+        glBufferData(GL_ARRAY_BUFFER,
+                     failureVertices.size()*sizeof(float),
+                     failureVertices.data(),
+                     GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_LINES,0,(int)failureVertices.size()/2);
+
+        // ImGui frame start
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // Draw markers onto the background layer so they're beneath the menu
+        {
+          int w,h; glfwGetFramebufferSize(gWindow, &w,&h);
+          int sz   = std::min(w,h), xoff=(w-sz)/2, yoff=(h-sz)/2;
+          float cellSize = (float)sz / COLS;
+          ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+          // Red circle at start
+          int sx = startCell % COLS, sy = startCell / COLS;
+          float cx = xoff + (sx+0.5f)*cellSize;
+          float cy = yoff + (sy+0.5f)*cellSize;
+          dl->AddCircleFilled(ImVec2(cx, cy), cellSize * 0.3f, IM_COL32(255,0,0,255));
+
+          // Hollow green square at end
+          int ex = endCell % COLS, ey = endCell / COLS;
+          float pad = cellSize * 0.1f;
+          float x0 = xoff + ex*cellSize + pad;
+          float y0 = yoff + ey*cellSize + pad;
+          float x1 = xoff + (ex+1)*cellSize - pad;
+          float y1 = yoff + (ey+1)*cellSize - pad;
+          dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(0,255,0,255), 0.0f, 0, 2.0f);
+        }
+
+        ImGui::Begin("Maze Controls");
+          if (ImGui::Button("Regenerate")) {
+            generateMaze();
+            buildWallVertices();
+            solving = false;
+            events.clear();
+            finalPathEdges.clear();
+            successVertices.clear();
+            failureVertices.clear();
+            eventIndex = 0;
+          }
+          ImGui::Separator();
+          ImGui::Text("Algorithm:");
+          ImGui::RadioButton("Depth-First", &solveAlgo, 0); ImGui::SameLine();
+          ImGui::RadioButton("Breadth-First", &solveAlgo, 1);
+          ImGui::SliderFloat("Speed", &speedMultiplier, 0.1f, 3.0f, "%.2fx");
+
+          // live elapsed time, scaled by speed
+          if (solving) {
+            double liveReal = glfwGetTime() - animStartTime;
+            double liveScaled = liveReal * speedMultiplier;
+            ImGui::Text("Elapsed: %.3f s", liveScaled);
+          }
+
+          if (solving) {
+            if (ImGui::Button("Stop")) solving = false;
+          } else {
+            if (ImGui::Button("Start")) {
+              events.clear();
+              finalPathEdges.clear();
+              successVertices.clear();
+              failureVertices.clear();
+              eventIndex = 0;
+              animState      = 0;
+              animStartTime  = glfwGetTime();
+              lastEventTime  = animStartTime;
+              if (solveAlgo == 0) solveDFS();
+              else            solveBFS();
+              solving = true;
+            }
+          }
+          if (animState == 1) {
+            double realElapsed = animEndTime - animStartTime;
+            double nominalElapsed = realElapsed * speedMultiplier;
+            ImGui::Text("Elapsed: %.3f s", nominalElapsed);
+          }
+        ImGui::End();
+
+        // render ImGui
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        glfwSwapBuffers(gWindow);
+    }
+
+    // cleanup
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(gWindow);
+    glfwTerminate();
+    return 0;
+}
