@@ -9,17 +9,18 @@
                 "-fdiagnostics-color=always",
                 "-g",
                 "${workspaceFolder}/src/main.cpp",                // Main source file
-                "${workspaceFolder}/src/glad.c",                  // GLAD for OpenGL function loading
-                "${workspaceFolder}/src/imgui.cpp",               // ImGui main source file
-                "${workspaceFolder}/src/imgui_draw.cpp",          // ImGui draw functions
-                "${workspaceFolder}/src/imgui_tables.cpp",        // ImGui table functions
-                "${workspaceFolder}/src/imgui_widgets.cpp",       // ImGui widget functions
-                "${workspaceFolder}/src/imgui_demo.cpp",          // ImGui demo file (optional)
-                "${workspaceFolder}/src/imgui_impl_glfw.cpp",     // ImGui GLFW backend implementation
-                "${workspaceFolder}/src/imgui_impl_opengl3.cpp",  // ImGui OpenGL3 backend implementation
+                "${workspaceFolder}/src/dependancies/glad.c",                  // GLAD for OpenGL function loading
+                "${workspaceFolder}/src/dependancies/imgui.cpp",               // ImGui main source file
+                "${workspaceFolder}/src/dependancies/imgui_draw.cpp",          // ImGui draw functions
+                "${workspaceFolder}/src/dependancies/imgui_tables.cpp",        // ImGui table functions
+                "${workspaceFolder}/src/dependancies/imgui_widgets.cpp",       // ImGui widget functions
+                "${workspaceFolder}/src/dependancies/imgui_demo.cpp",          // ImGui demo file (optional)
+                "${workspaceFolder}/src/dependancies/imgui_impl_glfw.cpp",     // ImGui GLFW backend implementation
+                "${workspaceFolder}/src/dependancies/imgui_impl_opengl3.cpp",  // ImGui OpenGL3 backend implementation
                 "-o", "${workspaceFolder}/OpenGL.exe",            // Output executable file
                 "-I", "${workspaceFolder}/include",               // Include path for header files
                 "-I", "${workspaceFolder}/include/imgui",         // ImGui headers directory
+                "-I", "${workspaceFolder}/src/dependancies",      // Added for dependancies headers
                 "-L", "${workspaceFolder}/lib",                   // Library path for linking
                 "-lglfw3dll",                                     // GLFW library for window/context management
                 "-lopengl32"                                      // OpenGL library for rendering
