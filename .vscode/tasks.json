@@ -17,6 +17,7 @@
                 "${workspaceFolder}/src/dependancies/imgui_demo.cpp",          // ImGui demo file (optional)
                 "${workspaceFolder}/src/dependancies/imgui_impl_glfw.cpp",     // ImGui GLFW backend implementation
                 "${workspaceFolder}/src/dependancies/imgui_impl_opengl3.cpp",  // ImGui OpenGL3 backend implementation
+                // stb_image implementation removed; now included only in main.cpp
                 "-o", "${workspaceFolder}/OpenGL.exe",            // Output executable file
                 "-I", "${workspaceFolder}/include",               // Include path for header files
                 "-I", "${workspaceFolder}/include/imgui",         // ImGui headers directory

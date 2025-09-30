@@ -1,6 +1,6 @@
 // main.cpp
-// Maze-Runner extended with robust logging and init fallbacks.
-// Writes logs to maze_runner.log and stderr. Opens Notepad on fatal.
+// Maze-Runner with texture assets + walls/paths drawn as ImGui lines (on top of background).
+// Robust logging and init fallbacks.
 
 #include "glad/glad.h"
 #include "GLFW/glfw3.h"
@@ -25,9 +25,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <cstdarg>
 #ifdef _WIN32
 #include <windows.h>
 #endif
+
+#include <cstring> // for memset
 
 // ======================= LOGGING =========================
 static std::ofstream gLog;
@@ -35,7 +38,6 @@ static void open_log()
 {
     gLog.open("maze_runner.log", std::ios::out | std::ios::trunc);
     if (!gLog) {
-        // fallback to stdout only
         fprintf(stderr, "Failed to open maze_runner.log\n");
     } else {
         time_t t = time(nullptr);
@@ -51,7 +53,9 @@ static void logf(const char* fmt, ...)
     fprintf(stderr, "\n");
     if (gLog) {
         char buf[4096];
-        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_list ap2; va_copy(ap2, ap);
+        vsnprintf(buf, sizeof(buf), fmt, ap2);
+        va_end(ap2);
         gLog << buf << "\n";
         gLog.flush();
     }
@@ -67,7 +71,6 @@ static void logf(const char* fmt, ...)
     fprintf(stderr, "FATAL: %s\n", buf);
     if (gLog) { gLog << "FATAL: " << buf << "\n"; gLog.flush(); }
 #ifdef _WIN32
-    // show a message box and open the log
     MessageBoxA(nullptr, buf, "Maze Runner fatal error", MB_OK | MB_ICONERROR);
     ShellExecuteA(nullptr, "open", "notepad.exe", "maze_runner.log", nullptr, SW_SHOWNORMAL);
 #endif
@@ -96,6 +99,8 @@ struct Cell
 };
 
 static std::vector<Cell> grid;
+
+// still keep these (we won’t render walls with GL anymore – using ImGui lines)
 static std::vector<float> wallVertices;
 static unsigned int wallVAO = 0, wallVBO = 0, borderVAO = 0, borderVBO = 0;
 
@@ -107,7 +112,7 @@ static int genAlgo = 0;   // 0 Backtracker, 1 Prim, 2 Kruskal
 
 static std::vector<std::tuple<int, int, bool, float>> events;
 static std::vector<std::pair<int, int>> finalPathEdges;
-static std::vector<float> successVertices;
+static std::vector<float> successVertices; // pairs of (x,y) points in grid space
 static std::vector<float> failureVertices;
 static size_t eventIndex = 0;
 static bool stepMode = false;
@@ -121,9 +126,68 @@ static glm::mat4 proj;
 
 static float speedMultiplier = 1.0f;
 static float obstacleDensity = 0.15f;
-static bool useWeights = true;
 static int maxWeight = 5;
 static float checkerAlpha = 0.07f;
+
+// Wall and UI icon textures
+static GLuint texWall = 0; // legacy, unused
+static GLuint texLineHori = 0;
+static GLuint texLineVerti = 0;
+static GLuint texPlay = 0, texPause = 0, texRegen = 0, texSettings = 0, texStep = 0;
+
+// =============== TEXTURES (stb_image) ===============
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+static GLuint texBackground = 0;
+static GLuint texStart = 0;
+static GLuint texEnd = 0;
+static GLuint texObstacle = 0;
+
+static GLuint loadTexture(const char* path)
+{
+    int w=0, h=0, n=0;
+    stbi_uc* data = stbi_load(path, &w, &h, &n, 4);
+    if (!data) {
+        logf("Failed to load texture: %s", path);
+        return 0;
+    }
+    GLuint id;
+    glGenTextures(1, &id);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    stbi_image_free(data);
+    logf("Loaded texture %s (%dx%d)", path, w, h);
+    return id;
+}
+
+static void loadAllTextures()
+{
+    texBackground = loadTexture("assets/background.png"); // 1024x1024
+    texStart      = loadTexture("assets/start.png");      // 64x64
+    texEnd        = loadTexture("assets/end.png");        // 64x64
+    texObstacle   = loadTexture("assets/obsticle.png");   // 64x64
+    texLineHori   = loadTexture("assets/lineHori.png");   // horizontal wall
+    texLineVerti  = loadTexture("assets/lineVerti.png");  // vertical wall
+    texWall       = 0; // legacy, not used
+    texPlay       = loadTexture("assets/play.png");
+    texPause      = loadTexture("assets/pause.png");
+    texRegen      = loadTexture("assets/regen.png");
+    texSettings   = loadTexture("assets/setting.png");
+    texStep       = loadTexture("assets/step.png");
+}
+
+static void deleteAllTextures()
+{
+    GLuint ids[11] = {texBackground, texStart, texEnd, texObstacle, texLineHori, texLineVerti, texPlay, texPause, texRegen, texSettings, texStep};
+    glDeleteTextures(11, ids);
+    texBackground = texStart = texEnd = texObstacle = texLineHori = texLineVerti = texPlay = texPause = texRegen = texSettings = texStep = 0;
+}
 
 // ======================= UTILS =========================
 inline int indexXY(int x, int y, int C, int R)
@@ -159,11 +223,13 @@ void clearGridVisited()
 void buildProjection()
 {
     proj = glm::ortho(0.0f, (float)gCols, (float)gRows, 0.0f);
-    glUseProgram(shader);
-    glUniformMatrix4fv(glGetUniformLocation(shader, "uProjection"), 1, GL_FALSE, &proj[0][0]);
+    if (shader) {
+        glUseProgram(shader);
+        glUniformMatrix4fv(glGetUniformLocation(shader, "uProjection"), 1, GL_FALSE, &proj[0][0]);
+    }
 }
 
-// ======================= SHADERS =========================
+// ======================= SHADERS (kept for future GL use) =========================
 unsigned int compileShader(unsigned int type, const char *src)
 {
     unsigned int id = glCreateShader(type);
@@ -200,7 +266,6 @@ unsigned int createProgram(const char* vs, const char* fs)
     return prog;
 }
 
-// Two versions to match 330 and 150
 static const char* VS_330 =
     "#version 330 core\n"
     "layout(location=0) in vec2 aPos;\n"
@@ -350,17 +415,66 @@ void pickStartEnd()
 
 void randomizeObstacles(float density)
 {
+    // 1. Find a path from start to end (BFS)
+    std::vector<int> parent(gCols * gRows, -1);
+    std::vector<bool> vis(gCols * gRows, false);
+    std::queue<int> q;
+    q.push(startCell);
+    vis[startCell] = true;
+    static const int dirs[4][3] = {{0, -1, 0}, {1, 0, 1}, {0, 1, 2}, {-1, 0, 3}};
+    bool found = false;
+    while (!q.empty()) {
+        int u = q.front(); q.pop();
+        if (u == endCell) { found = true; break; }
+        int x = u % gCols, y = u / gCols;
+        for (auto &d : dirs) {
+            int v = index(x + d[0], y + d[1]);
+            if (v < 0 || grid[u].walls[d[2]] || vis[v]) continue;
+            vis[v] = true;
+            parent[v] = u;
+            q.push(v);
+        }
+    }
+    // 2. Mark the path as protected
+    std::vector<bool> protectedPath(gCols * gRows, false);
+    if (found) {
+        int cur = endCell;
+        while (cur != -1) {
+            protectedPath[cur] = true;
+            cur = parent[cur];
+        }
+    } else {
+        // fallback: no path, so don't block anything
+        for (auto &c : grid) c.blocked = false;
+        return;
+    }
+    // 3. Place obstacles randomly, but never on the protected path, start, or end
     std::bernoulli_distribution b(density);
-    for (int i = 0; i < gCols * gRows; i++)
-        grid[i].blocked = b(rng);
-    if (grid[startCell].blocked) grid[startCell].blocked = false;
-    if (grid[endCell].blocked) grid[endCell].blocked = false;
+    int minObstacles = std::max(1, (int)(gCols * gRows * 0.05f)); // at least 5% of grid
+    std::vector<int> candidates;
+    int placed = 0;
+    for (int i = 0; i < gCols * gRows; i++) {
+        if (protectedPath[i] || i == startCell || i == endCell) {
+            grid[i].blocked = false;
+        } else {
+            candidates.push_back(i);
+            bool block = b(rng);
+            grid[i].blocked = block;
+            if (block) placed++;
+        }
+    }
+    // If not enough obstacles placed, force some
+    if (placed < minObstacles && !candidates.empty()) {
+        std::shuffle(candidates.begin(), candidates.end(), rng);
+        for (int j = 0; j < minObstacles && j < (int)candidates.size(); ++j) {
+            grid[candidates[j]].blocked = true;
+        }
+    }
 }
 void clearObstacles(){ for (auto &c : grid) c.blocked = false; }
 
-void randomizeWeights(bool enable, int maxW)
+void randomizeWeights(int maxW)
 {
-    if (!enable) { for (auto &c : grid) c.weight = 1; return; }
     std::uniform_int_distribution<int> w(1, std::max(1,maxW));
     for (auto &c : grid) c.weight = w(rng);
     grid[startCell].weight = 1;
@@ -383,7 +497,178 @@ inline void pushEvent(int u, int v, bool ok, float wCost=1.0f)
     events.emplace_back(u, v, ok, wCost);
 }
 
+// ======================= DRAW HELPERS =========================
+static inline ImTextureID toImguiTex(GLuint id){ return (ImTextureID)(intptr_t)id; }
+
+static void computeViewportAndCell(float& xoff, float& yoff, float& cell, int& sz)
+{
+    int w, h;
+    glfwGetFramebufferSize(gWindow, &w, &h);
+    sz = std::min(w, h);
+    xoff = (float)(w - sz) * 0.5f;
+    yoff = (float)(h - sz) * 0.5f;
+    cell = (float)sz / (float)gCols;
+}
+
+// background, obstacles, start/end as images
+void drawTexturedLayer()
+{
+    float xoff, yoff, cell; int sz;
+    computeViewportAndCell(xoff, yoff, cell, sz);
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    // Background image fills the square area
+    if (texBackground)
+        dl->AddImage(toImguiTex(texBackground),
+                     ImVec2(xoff, yoff),
+                     ImVec2(xoff + sz, yoff + sz));
+
+    // light checker to keep grid sense
+    for (int y = 0; y < gRows; y++)
+    for (int x = 0; x < gCols; x++)
+    {
+        float x0 = xoff + x * cell;
+        float y0 = yoff + y * cell;
+        float x1 = x0 + cell;
+        float y1 = y0 + cell;
+        bool alt = ((x + y) & 1) == 0;
+        ImU32 col = alt ? IM_COL32(255, 255, 255, (int)(checkerAlpha * 255))
+                        : IM_COL32(255, 255, 255, (int)(checkerAlpha * 180));
+        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), col);
+    }
+
+    // obstacles
+    if (texObstacle)
+    {
+        for (int i = 0; i < gCols * gRows; i++)
+        {
+            if (!grid[i].blocked) continue;
+            int x = i % gCols, y = i / gCols;
+            float x0 = xoff + x * cell, y0 = yoff + y * cell;
+            float x1 = x0 + cell,     y1 = y0 + cell;
+            dl->AddImage(toImguiTex(texObstacle), ImVec2(x0,y0), ImVec2(x1,y1));
+        }
+    }
+
+    // start
+    if (texStart)
+    {
+        int sx = startCell % gCols, sy = startCell / gCols;
+        float x0 = xoff + sx * cell, y0 = yoff + sy * cell;
+        dl->AddImage(toImguiTex(texStart), ImVec2(x0,y0), ImVec2(x0+cell,y0+cell));
+    }
+    // end
+    if (texEnd)
+    {
+        int ex = endCell % gCols, ey = endCell / gCols;
+        float x0 = xoff + ex * cell, y0 = yoff + ey * cell;
+        dl->AddImage(toImguiTex(texEnd), ImVec2(x0,y0), ImVec2(x0+cell,y0+cell));
+    }
+}
+
+// draw maze walls as textured images (line.png)
+void drawWallsAsLines()
+{
+    float xoff, yoff, cell; int sz;
+    computeViewportAndCell(xoff, yoff, cell, sz);
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    float thickness = cell * 0.08f; // consistent thickness
+    for (int y = 0; y < gRows; ++y)
+    for (int x = 0; x < gCols; ++x)
+    {
+        int i = index(x,y);
+        float xf = xoff + x * cell;
+        float yf = yoff + y * cell;
+        // Top wall (horizontal)
+        if (grid[i].walls[0] && texLineHori) {
+            ImVec2 p0(xf, yf);
+            ImVec2 p1(xf + cell, yf + thickness);
+            dl->AddImage(toImguiTex(texLineHori), p0, p1);
+        }
+        // Right wall (vertical)
+        if (grid[i].walls[1] && texLineVerti) {
+            ImVec2 p0(xf + cell - thickness, yf);
+            ImVec2 p1(xf + cell, yf + cell);
+            dl->AddImage(toImguiTex(texLineVerti), p0, p1);
+        }
+        // Bottom wall (horizontal)
+        if (grid[i].walls[2] && texLineHori) {
+            ImVec2 p0(xf, yf + cell - thickness);
+            ImVec2 p1(xf + cell, yf + cell);
+            dl->AddImage(toImguiTex(texLineHori), p0, p1);
+        }
+        // Left wall (vertical)
+        if (grid[i].walls[3] && texLineVerti) {
+            ImVec2 p0(xf, yf);
+            ImVec2 p1(xf + thickness, yf + cell);
+            dl->AddImage(toImguiTex(texLineVerti), p0, p1);
+        }
+    }
+
+    // outer border
+    const ImU32 borderCol = IM_COL32(255, 128, 179, 255); // 1.0,0.5,0.7
+    float x0 = xoff, y0 = yoff, x1 = xoff + sz, y1 = yoff + sz;
+    dl->AddRect(ImVec2(x0,y0), ImVec2(x1,y1), borderCol, 0.0f, 0, std::max(2.0f, cell * 0.08f));
+}
+
+// draw success (purple) and failure (red) path segments as ImGui lines
+void drawPathsAsLines()
+{
+    float xoff, yoff, cell; int sz;
+    computeViewportAndCell(xoff, yoff, cell, sz);
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    auto drawPairs = [&](const std::vector<float>& v, ImU32 c, float thick)
+    {
+        for (size_t i = 0; i + 3 < v.size(); i += 4)
+        {
+            float ux = xoff + v[i+0] * cell;
+            float uy = yoff + v[i+1] * cell;
+            float vx = xoff + v[i+2] * cell;
+            float vy = yoff + v[i+3] * cell;
+            dl->AddLine(ImVec2(ux,uy), ImVec2(vx,vy), c, thick);
+        }
+    };
+
+    float thickSuccess = std::max(2.0f, cell * 0.10f);
+    float thickFail    = std::max(1.5f, cell * 0.06f);
+    drawPairs(successVertices, IM_COL32(180, 80, 255, 255), thickSuccess); // purple
+    drawPairs(failureVertices, IM_COL32(255,153,153,255), thickFail);
+}
+
+// ======================= DRAW SETUP (GL buffers kept minimal) =========================
+void buildWallVertices()
+{
+    wallVertices.clear();
+    for (int y = 0; y < gRows; y++)
+    for (int x = 0; x < gCols; x++)
+    {
+        int i = index(x, y);
+        float xf = (float)x, yf = (float)y;
+        if (grid[i].walls[0]) wallVertices.insert(wallVertices.end(), {xf, yf, xf + 1, yf});
+        if (grid[i].walls[1]) wallVertices.insert(wallVertices.end(), {xf + 1, yf, xf + 1, yf + 1});
+        if (grid[i].walls[2]) wallVertices.insert(wallVertices.end(), {xf + 1, yf + 1, xf, yf + 1});
+        if (grid[i].walls[3]) wallVertices.insert(wallVertices.end(), {xf, yf + 1, xf, yf});
+    }
+}
+
+void rebuildBorderVAO() { /* no-op for ImGui walls */ }
+
 // ======================= SOLVERS =========================
+inline void pushSuccess(int u, int v)
+{
+    float ux = (u % gCols) + 0.5f, uy = (u / gCols) + 0.5f;
+    float vx = (v % gCols) + 0.5f, vy = (v / gCols) + 0.5f;
+    successVertices.insert(successVertices.end(), {ux, uy, vx, vy});
+}
+inline void pushFailure(int u, int v)
+{
+    float ux = (u % gCols) + 0.5f, uy = (u / gCols) + 0.5f;
+    float vx = (v % gCols) + 0.5f, vy = (v / gCols) + 0.5f;
+    failureVertices.insert(failureVertices.end(), {ux, uy, vx, vy});
+}
+
 void solveDFS()
 {
     int N = gCols * gRows;
@@ -469,7 +754,7 @@ void solveDijkstra()
         {
             int v = index(x + d[0], y + d[1]);
             if (v < 0 || grid[u].walls[d[2]] || grid[v].blocked) continue;
-            float w = useWeights ? (float)grid[v].weight : 1.0f;
+            float w = (float)grid[v].weight;
             if (dist[v] > du + w)
             {
                 dist[v] = du + w;
@@ -525,7 +810,7 @@ void solveAStar()
         {
             int v = index(x + d[0], y + d[1]);
             if (v < 0 || grid[u].walls[d[2]] || grid[v].blocked) continue;
-            float w = useWeights ? (float)grid[v].weight : 1.0f;
+            float w = (float)grid[v].weight;
             float tent = gScore[u] + w;
             if (tent < gScore[v])
             {
@@ -554,203 +839,6 @@ void solveAStar()
     }
 }
 
-// ======================= DRAW SETUP =========================
-void buildWallVertices()
-{
-    wallVertices.clear();
-    for (int y = 0; y < gRows; y++)
-    {
-        for (int x = 0; x < gCols; x++)
-        {
-            int i = index(x, y);
-            float xf = (float)x, yf = (float)y;
-            if (grid[i].walls[0])
-                wallVertices.insert(wallVertices.end(), {xf, yf, xf + 1, yf});
-            if (grid[i].walls[1])
-                wallVertices.insert(wallVertices.end(), {xf + 1, yf, xf + 1, yf + 1});
-            if (grid[i].walls[2])
-                wallVertices.insert(wallVertices.end(), {xf + 1, yf + 1, xf, yf + 1});
-            if (grid[i].walls[3])
-                wallVertices.insert(wallVertices.end(), {xf, yf + 1, xf, yf});
-        }
-    }
-    glBindBuffer(GL_ARRAY_BUFFER, wallVBO);
-    glBufferData(GL_ARRAY_BUFFER,
-                 wallVertices.size() * sizeof(float),
-                 wallVertices.data(),
-                 GL_STATIC_DRAW);
-}
-
-void rebuildBorderVAO()
-{
-    std::vector<float> borderVertices = {
-        0.0f, 0.0f,
-        (float)gCols, 0.0f,
-        (float)gCols, (float)gRows,
-        0.0f, (float)gRows};
-    glBindVertexArray(borderVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, borderVBO);
-    glBufferData(GL_ARRAY_BUFFER,
-                 borderVertices.size() * sizeof(float),
-                 borderVertices.data(),
-                 GL_STATIC_DRAW);
-}
-
-void drawBackgroundCells()
-{
-    int w, h;
-    glfwGetFramebufferSize(gWindow, &w, &h);
-    int sz = std::min(w, h), xoff = (w - sz) / 2, yoff = (h - sz) / 2;
-    float cell = (float)sz / gCols;
-    ImDrawList *dl = ImGui::GetBackgroundDrawList();
-
-    for (int y = 0; y < gRows; y++)
-    {
-        for (int x = 0; x < gCols; x++)
-        {
-            float x0 = xoff + x * cell;
-            float y0 = yoff + y * cell;
-            float x1 = xoff + (x + 1) * cell;
-            float y1 = yoff + (y + 1) * cell;
-
-            bool alt = ((x + y) & 1) == 0;
-            ImU32 col = alt ? IM_COL32(255, 255, 255, (int)(checkerAlpha * 255))
-                            : IM_COL32(255, 255, 255, (int)(checkerAlpha * 180));
-            dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), col);
-
-            int i = index(x,y);
-            if (grid[i].blocked)
-                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(60, 60, 60, 200));
-            else if (useWeights && grid[i].weight > 1)
-            {
-                float t = std::min(1.0f, (grid[i].weight - 1) / (float)std::max(1,maxWeight));
-                ImU32 wt = IM_COL32((int)(255 * t), (int)(120 * t), 0, 70);
-                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), wt);
-            }
-        }
-    }
-}
-
-void drawMarkers()
-{
-    int w, h;
-    glfwGetFramebufferSize(gWindow, &w, &h);
-    int sz = std::min(w, h), xoff = (w - sz) / 2, yoff = (h - sz) / 2;
-    float cellSize = (float)sz / gCols;
-    ImDrawList *dl = ImGui::GetBackgroundDrawList();
-
-    int sx = startCell % gCols, sy = startCell / gCols;
-    float cx = xoff + (sx + 0.5f) * cellSize;
-    float cy = yoff + (sy + 0.5f) * cellSize;
-    dl->AddCircleFilled(ImVec2(cx, cy), cellSize * 0.3f, IM_COL32(255, 0, 0, 255));
-
-    int ex = endCell % gCols, ey = endCell / gCols;
-    float pad = cellSize * 0.1f;
-    float x0 = xoff + ex * cellSize + pad;
-    float y0 = yoff + ey * cellSize + pad;
-    float x1 = xoff + (ex + 1) * cellSize - pad;
-    float y1 = yoff + (ey + 1) * cellSize - pad;
-    dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(0, 255, 0, 255), 0.0f, 0, 2.0f);
-}
-
-// ======================= INIT HELPERS =========================
-static void glfw_error_cb(int code, const char* desc){
-    logf("GLFW error %d: %s", code, desc);
-}
-
-static bool init_glfw_and_window()
-{
-    glfwSetErrorCallback(glfw_error_cb);
-    if (!glfwInit()){
-        logf("glfwInit failed");
-        return false;
-    }
-
-    // First try 3.3 core
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_SAMPLES, 4);
-
-    gWindow = glfwCreateWindow(1000, 900, "Maze-Runner", nullptr, nullptr);
-    if (!gWindow){
-        logf("glfwCreateWindow failed for 3.3 core. Trying 3.0 compat.");
-        // Fallback to 3.0 no profile
-        glfwDefaultWindowHints();
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-        glfwWindowHint(GLFW_SAMPLES, 4);
-        gWindow = glfwCreateWindow(1000, 900, "Maze-Runner", nullptr, nullptr);
-        if (!gWindow){
-            logf("glfwCreateWindow failed for 3.0 compat as well");
-            glfwTerminate();
-            return false;
-        }
-    }
-
-    glfwMakeContextCurrent(gWindow);
-    glfwSwapInterval(1);
-    return true;
-}
-
-static bool init_glad_and_dump_info()
-{
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)){
-        logf("gladLoadGLLoader failed");
-        return false;
-    }
-    const GLubyte* vendor   = glGetString(GL_VENDOR);
-    const GLubyte* renderer = glGetString(GL_RENDERER);
-    const GLubyte* version  = glGetString(GL_VERSION);
-    const GLubyte* glsl     = glGetString(GL_SHADING_LANGUAGE_VERSION);
-    logf("GL_VENDOR:   %s", vendor ? (const char*)vendor : "null");
-    logf("GL_RENDERER: %s", renderer ? (const char*)renderer : "null");
-    logf("GL_VERSION:  %s", version ? (const char*)version : "null");
-    logf("GLSL:        %s", glsl ? (const char*)glsl : "null");
-    return true;
-}
-
-static bool init_imgui_with_fallback(const char** used_glsl)
-{
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    if (!ImGui_ImplGlfw_InitForOpenGL(gWindow, true)){
-        logf("ImGui_ImplGlfw_InitForOpenGL failed");
-        return false;
-    }
-    if (!ImGui_ImplOpenGL3_Init("#version 330")){
-        logf("ImGui_ImplOpenGL3_Init 330 failed. Trying 150.");
-        if (!ImGui_ImplOpenGL3_Init("#version 150")){
-            logf("ImGui_ImplOpenGL3_Init 150 failed");
-            return false;
-        }
-        *used_glsl = "#version 150";
-    } else {
-        *used_glsl = "#version 330";
-    }
-    ImGui::StyleColorsDark();
-    return true;
-}
-
-static unsigned int try_create_shader_program()
-{
-    // Prefer 330 shaders
-    unsigned int prog = createProgram(VS_330, FS_330);
-    GLint linked = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    if (linked) return prog;
-
-    logf("Link failed for 330 shaders. Trying 150 shaders.");
-    glDeleteProgram(prog);
-    prog = createProgram(VS_150, FS_150);
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    if (!linked){
-        logf("Link failed for 150 shaders too");
-        return 0;
-    }
-    return prog;
-}
-
 // ======================= REGEN AND UI =========================
 void regenerateMaze()
 {
@@ -765,7 +853,6 @@ void regenerateMaze()
 int main()
 {
 #ifdef _WIN32
-    // Ensure console for double click
     if (!GetConsoleWindow()){
         AllocConsole();
         FILE* fp;
@@ -775,74 +862,82 @@ int main()
 #endif
     open_log();
 
-    if (!init_glfw_and_window())
-        fatal("GLFW window creation failed. See maze_runner.log");
+    // GLFW + Window
+    glfwSetErrorCallback([](int c, const char* d){ logf("GLFW error %d: %s", c, d); });
+    if (!glfwInit()) fatal("glfwInit failed");
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+    gWindow = glfwCreateWindow(1000, 900, "Maze-Runner", nullptr, nullptr);
+    if (!gWindow){
+        glfwDefaultWindowHints();
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+        glfwWindowHint(GLFW_SAMPLES, 4);
+        gWindow = glfwCreateWindow(1000, 900, "Maze-Runner", nullptr, nullptr);
+        if (!gWindow) fatal("glfwCreateWindow failed");
+    }
+    glfwMaximizeWindow(gWindow); // Start maximized, not fullscreen
 
+    // Set app icon using assets/logo.png
+    {
+        int iconW = 0, iconH = 0, iconC = 0;
+        unsigned char* iconPixels = stbi_load("assets/logo.png", &iconW, &iconH, &iconC, 4);
+        if (iconPixels && iconW > 0 && iconH > 0) {
+            GLFWimage icon;
+            icon.width = iconW;
+            icon.height = iconH;
+            icon.pixels = iconPixels;
+            glfwSetWindowIcon(gWindow, 1, &icon);
+            stbi_image_free(iconPixels);
+        }
+    }
+    glfwMakeContextCurrent(gWindow);
+    glfwSwapInterval(1);
     glfwSetFramebufferSizeCallback(gWindow, framebuffer_size_callback);
 
-    if (!init_glad_and_dump_info())
-        fatal("GLAD init failed. Update GPU driver or install latest OpenGL runtime");
+    // GLAD
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+        fatal("GLAD init failed");
 
-    // smoothing and blending
     glEnable(GL_MULTISAMPLE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glEnable(GL_LINE_SMOOTH);
-    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
 
-    const char* imgui_glsl = nullptr;
-    if (!init_imgui_with_fallback(&imgui_glsl))
-        fatal("ImGui backend init failed. See log");
+    // ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    if (!ImGui_ImplGlfw_InitForOpenGL(gWindow, true)) fatal("ImGui_ImplGlfw_InitForOpenGL failed");
+    if (!ImGui_ImplOpenGL3_Init("#version 330"))
+        if (!ImGui_ImplOpenGL3_Init("#version 150")) fatal("ImGui_ImplOpenGL3_Init failed");
+    // Themed ImGui style
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 12.0f;
+    style.FrameRounding = 8.0f;
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.13f, 0.10f, 0.18f, 0.95f);
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.22f, 0.16f, 0.32f, 1.0f);
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.32f, 0.22f, 0.52f, 1.0f);
+    style.Colors[ImGuiCol_Button] = ImVec4(0.32f, 0.22f, 0.52f, 0.85f);
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.45f, 0.32f, 0.70f, 1.0f);
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.60f, 0.40f, 0.80f, 1.0f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.18f, 0.13f, 0.25f, 1.0f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.32f, 0.22f, 0.52f, 1.0f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.45f, 0.32f, 0.70f, 1.0f);
 
-    // VAOs
-    glGenVertexArrays(1, &wallVAO);
-    glGenBuffers(1, &wallVBO);
-    glBindVertexArray(wallVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, wallVBO);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
+    // (Shaders/VAOs kept, but not required for walls now)
+    shader = createProgram(VS_330, FS_330);
 
-    glGenVertexArrays(1, &borderVAO);
-    glGenBuffers(1, &borderVBO);
-    glBindVertexArray(borderVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, borderVBO);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
+    // Textures
+    stbi_set_flip_vertically_on_load(false);
+    loadAllTextures();
 
-    glGenVertexArrays(1, &failureVAO);
-    glGenBuffers(1, &failureVBO);
-    glBindVertexArray(failureVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, failureVBO);
-    glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
-
-    glGenVertexArrays(1, &successVAO);
-    glGenBuffers(1, &successVBO);
-    glBindVertexArray(successVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, successVBO);
-    glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
-
-    shader = try_create_shader_program();
-    if (!shader)
-        fatal("Shader program creation failed. See log for compile and link errors");
-
-    buildProjection();
-
-    // initial maze
+    // Initial maze
     regenerateMaze();
-    randomizeWeights(useWeights, maxWeight);
+    randomizeWeights(maxWeight);
 
-    // border data
-    rebuildBorderVAO();
-
-    // animation timing
     const double baseDelay = 0.005;
     double lastEventTime = 0.0;
-
-    logf("Init complete. Using ImGui GLSL: %s", imgui_glsl ? imgui_glsl : "unknown");
 
     while (!glfwWindowShouldClose(gWindow))
     {
@@ -850,116 +945,88 @@ int main()
         glClearColor(0.05f, 0.05f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        // background and markers
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-        drawBackgroundCells();
-        drawMarkers();
 
-        // walls
-        glUseProgram(shader);
-        glLineWidth(1.5f);
-        glUniform3f(glGetUniformLocation(shader, "uColor"), 0.60f, 0.40f, 0.80f);
-        glBindVertexArray(wallVAO);
-        glDrawArrays(GL_LINES, 0, (int)wallVertices.size() / 2);
+        // 1) Background + assets
+        drawTexturedLayer();
 
-        // border
-        glUniform3f(glGetUniformLocation(shader, "uColor"), 1.00f, 0.50f, 0.70f);
-        glBindVertexArray(borderVAO);
-        glLineWidth(2.0f);
-        glDrawArrays(GL_LINE_LOOP, 0, 4);
+        // 2) Maze walls (as lines) and dynamic paths – ABOVE background, BELOW UI windows
+        drawWallsAsLines();
+        drawPathsAsLines();
 
-        // animate solver
-        if (solving && animState == 0 && !stepMode)
-        {
-            double ct = glfwGetTime();
-            while (eventIndex < events.size() &&
-                   (ct - lastEventTime) >= (baseDelay / speedMultiplier))
-            {
-                auto [u, v, ok, wCost] = events[eventIndex++];
-                float ux = (u % gCols) + 0.5f, uy = (u / gCols) + 0.5f;
-                float vx = (v % gCols) + 0.5f, vy = (v / gCols) + 0.5f;
+        // -------- SIDE MENU UI --------
+        // Custom white & purple theme for side menu
+        ImGuiStyle& s = ImGui::GetStyle();
+        ImVec4 origCol[ImGuiCol_COUNT];
+        for (int i = 0; i < ImGuiCol_COUNT; ++i) origCol[i] = s.Colors[i];
+    s.Colors[ImGuiCol_WindowBg] = ImVec4(0.97f, 0.95f, 1.0f, 0.99f);
+    s.Colors[ImGuiCol_TitleBg] = ImVec4(0.70f, 0.55f, 0.95f, 1.0f);
+    s.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.80f, 0.60f, 1.0f, 1.0f);
+    s.Colors[ImGuiCol_Button] = ImVec4(0.80f, 0.60f, 1.0f, 0.85f);
+    s.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.90f, 0.80f, 1.0f, 1.0f);
+    s.Colors[ImGuiCol_ButtonActive] = ImVec4(0.60f, 0.40f, 0.80f, 1.0f);
+    s.Colors[ImGuiCol_FrameBg] = ImVec4(0.93f, 0.90f, 1.0f, 1.0f);
+    s.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.80f, 0.60f, 1.0f, 1.0f);
+    s.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.70f, 0.55f, 0.95f, 1.0f);
+    s.Colors[ImGuiCol_Text] = ImVec4(0.30f, 0.10f, 0.40f, 1.0f);
+    s.Colors[ImGuiCol_SliderGrab] = ImVec4(0.80f, 0.60f, 1.0f, 1.0f);
+    s.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.60f, 0.40f, 0.80f, 1.0f);
+    s.Colors[ImGuiCol_CheckMark] = ImVec4(0.60f, 0.40f, 0.80f, 1.0f);
+    s.WindowRounding = 0.0f; // Square edges for sidebar
 
-                if (ok)
-                    successVertices.insert(successVertices.end(), {ux, uy, vx, vy});
-                else {
-                    if ((solveAlgo == 0) && successVertices.size() >= 4)
-                        successVertices.erase(successVertices.end() - 4, successVertices.end());
-                    failureVertices.insert(failureVertices.end(), {ux, uy, vx, vy});
-                }
-                lastEventTime += (baseDelay / speedMultiplier);
-                ct = glfwGetTime();
-            }
-            if (eventIndex >= events.size())
-            {
-                animState = 1;
-                animEndTime = glfwGetTime();
-                solving = false;
-            }
-        }
+        // Sidebar: fixed to the left, full height
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+        float sidebarWidth = 340.0f;
+        ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x, viewport->Pos.y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(sidebarWidth, viewport->Size.y), ImGuiCond_Always);
+        ImGui::Begin("Maze Controls", nullptr,
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar);
 
-        // draw success path
-        glLineWidth(2.5f);
-        glUniform3f(glGetUniformLocation(shader, "uColor"), 0.50f, 1.00f, 0.50f);
-        glBindVertexArray(successVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, successVBO);
-        glBufferData(GL_ARRAY_BUFFER,
-                     successVertices.size() * sizeof(float),
-                     successVertices.data(),
-                     GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_LINES, 0, (int)successVertices.size() / 2);
-
-        // draw failure
-        glLineWidth(1.5f);
-        glUniform3f(glGetUniformLocation(shader, "uColor"), 1.00f, 0.60f, 0.60f);
-        glBindVertexArray(failureVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, failureVBO);
-        glBufferData(GL_ARRAY_BUFFER,
-                     failureVertices.size() * sizeof(float),
-                     failureVertices.data(),
-                     GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_LINES, 0, (int)failureVertices.size() / 2);
-
-        // UI
-        ImGui::Begin("Maze Controls");
-
-        static int uiCols = gCols, uiRows = gRows;
+        // Sidebar header
+    ImGui::SetCursorPosY(24);
+    ImGui::SetCursorPosX(24);
+    ImGui::PushFont(ImGui::GetFont());
+    ImGui::TextColored(ImVec4(0.60f, 0.40f, 0.80f, 1.0f), "\xef\x9a\x99  Maze Runner");
+    ImGui::PopFont();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+    ImGui::Separator();
+        // Grid controls
         ImGui::Text("Grid");
+        static int uiCols = gCols, uiRows = gRows;
         ImGui::SliderInt("Cols", &uiCols, 5, 60);
         ImGui::SliderInt("Rows", &uiRows, 5, 60);
-        if ((uiCols != gCols) || (uiRows != gRows))
-        {
-            if (ImGui::Button("Apply Size"))
-            {
+        if ((uiCols != gCols) || (uiRows != gRows)) {
+            if (texSettings && ImGui::ImageButton("settings", toImguiTex(texSettings), ImVec2(28,28))) {
                 gCols = uiCols; gRows = uiRows;
                 regenerateMaze();
-                randomizeWeights(useWeights, maxWeight);
+                randomizeWeights(maxWeight);
                 buildProjection();
-                rebuildBorderVAO();
-                buildWallVertices();
                 logf("Applied size C=%d R=%d", gCols, gRows);
             }
+            ImGui::SameLine();
+            ImGui::Text("Apply Size");
         }
         ImGui::Separator();
-
+        // Generation controls
         ImGui::Text("Generation");
         const char* genNames[] = {"Backtracker", "Prim", "Kruskal"};
         ImGui::Combo("Gen Algo", &genAlgo, genNames, IM_ARRAYSIZE(genNames));
-        if (ImGui::Button("Regenerate"))
-        {
+        if (texRegen && ImGui::ImageButton("regen", toImguiTex(texRegen), ImVec2(28,28))) {
             regenerateMaze();
-            randomizeWeights(useWeights, maxWeight);
-            buildWallVertices();
+            randomizeWeights(maxWeight);
             logf("Regenerated with algo %d", genAlgo);
         }
         ImGui::SameLine();
+        ImGui::Text("Regenerate");
+        ImGui::SameLine();
         if (ImGui::Button("New Start/End"))
             pickStartEnd();
-
         ImGui::Separator();
-        ImGui::Text("Obstacles and Weights");
-        ImGui::Checkbox("Use Weights", &useWeights);
+        // Obstacles/Weights controls
+        ImGui::Text("Obstacles / Weights");
         ImGui::SliderInt("Max Weight", &maxWeight, 2, 15);
         ImGui::SliderFloat("Obstacle Density", &obstacleDensity, 0.0f, 0.6f, "%.2f");
         if (ImGui::Button("Random Obstacles"))
@@ -968,29 +1035,25 @@ int main()
         if (ImGui::Button("Clear Obstacles"))
             clearObstacles();
         if (ImGui::Button("Random Weights"))
-            randomizeWeights(useWeights, maxWeight);
+            randomizeWeights(maxWeight);
         ImGui::SameLine();
-        if (ImGui::Button("Clear Weights"))
-            randomizeWeights(false, 1);
-
+        if (ImGui::Button("Clear Weights")) {
+            for (auto &c : grid) c.weight = 1;
+        }
         ImGui::Separator();
+        // Solving controls
         ImGui::Text("Solving");
         const char* solveNames[] = {"Depth-First", "Breadth-First", "Dijkstra", "A*"};
         ImGui::Combo("Solve Algo", &solveAlgo, solveNames, IM_ARRAYSIZE(solveNames));
         ImGui::SliderFloat("Speed", &speedMultiplier, 0.1f, 5.0f, "%.2fx");
         ImGui::Checkbox("Step Mode", &stepMode);
-
-        if (solving)
-        {
+        if (solving) {
             double liveReal = glfwGetTime() - animStartTime;
             double liveScaled = stepMode ? liveReal : (liveReal * speedMultiplier);
             ImGui::Text("Elapsed: %.3f s", liveScaled);
         }
-
-        if (!solving && animState == 0)
-        {
-            if (ImGui::Button("Start"))
-            {
+        if (!solving && animState == 0) {
+            if (texPlay && ImGui::ImageButton("play", toImguiTex(texPlay), ImVec2(32,32))) {
                 resetAnimationBuffers();
                 animStartTime = glfwGetTime();
                 lastEventTime = animStartTime;
@@ -1001,28 +1064,23 @@ int main()
                 solving = true;
                 logf("Solve started with algo %d", solveAlgo);
             }
-        }
-        else if (solving && animState == 0)
-        {
-            if (ImGui::Button("Pause")) { solving = false; logf("Paused"); }
             ImGui::SameLine();
-            if (stepMode)
-            {
-                if (ImGui::Button("Step"))
-                {
-                    if (eventIndex < events.size())
-                    {
+            ImGui::Text("Play");
+        } else if (solving && animState == 0) {
+            if (texPause && ImGui::ImageButton("pause", toImguiTex(texPause), ImVec2(32,32))) { solving = false; logf("Paused"); }
+            ImGui::SameLine();
+            ImGui::Text("Pause");
+            if (stepMode) {
+                if (texStep && ImGui::ImageButton("step", toImguiTex(texStep), ImVec2(32,32))) {
+                    if (eventIndex < events.size()) {
                         auto [u, v, ok, wCost] = events[eventIndex++];
-                        float ux = (u % gCols) + 0.5f, uy = (u / gCols) + 0.5f;
-                        float vx = (v % gCols) + 0.5f, vy = (v / gCols) + 0.5f;
-                        if (ok) successVertices.insert(successVertices.end(), {ux, uy, vx, vy});
+                        if (ok) pushSuccess(u,v);
                         else {
                             if ((solveAlgo == 0) && successVertices.size() >= 4)
                                 successVertices.erase(successVertices.end()-4, successVertices.end());
-                            failureVertices.insert(failureVertices.end(), {ux, uy, vx, vy});
+                            pushFailure(u,v);
                         }
-                        if (eventIndex >= events.size())
-                        {
+                        if (eventIndex >= events.size()) {
                             animState = 1;
                             animEndTime = glfwGetTime();
                             solving = false;
@@ -1030,29 +1088,77 @@ int main()
                         }
                     }
                 }
+                ImGui::SameLine();
+                ImGui::Text("Step");
             }
-        }
-        else if (!solving && animState == 1)
-        {
+            // animate auto mode
+            if (!stepMode) {
+                double ct = glfwGetTime();
+                while (eventIndex < events.size() &&
+                       (ct - lastEventTime) >= (baseDelay / speedMultiplier)) {
+                    auto [u, v, ok, wCost] = events[eventIndex++];
+                    if (ok) pushSuccess(u,v);
+                    else {
+                        if ((solveAlgo == 0) && successVertices.size() >= 4)
+                            successVertices.erase(successVertices.end()-4, successVertices.end());
+                        pushFailure(u,v);
+                    }
+                    lastEventTime += (baseDelay / speedMultiplier);
+                    ct = glfwGetTime();
+                }
+                if (eventIndex >= events.size()) {
+                    animState = 1;
+                    animEndTime = glfwGetTime();
+                    solving = false;
+                }
+            }
+        } else if (!solving && animState == 1) {
             double realElapsed = animEndTime - animStartTime;
             double nominalElapsed = realElapsed * speedMultiplier;
             ImGui::Text("Elapsed: %.3f s", stepMode ? realElapsed : nominalElapsed);
             if (ImGui::Button("Reset Run")) { resetAnimationBuffers(); logf("Run reset"); }
         }
-
-        if (!solving)
-        {
+        if (!solving) {
             ImGui::SameLine();
-            if (ImGui::Button("Clear Lines"))
-            {
+            if (ImGui::Button("Clear Lines")) {
                 successVertices.clear();
                 failureVertices.clear();
             }
         }
         ImGui::Separator();
+        // Display controls
+        ImGui::Text("Display");
         ImGui::SliderFloat("Checker Alpha", &checkerAlpha, 0.0f, 0.25f, "%.3f");
-
+    // ...existing code...
         ImGui::End();
+        // Restore original style
+        for (int i = 0; i < ImGuiCol_COUNT; ++i) s.Colors[i] = origCol[i];
+
+        // -------- THEMED OUTER BACKGROUND --------
+        // Draw a purple gradient or color on the area outside the maze
+        float xoff, yoff, cell; int sz;
+        computeViewportAndCell(xoff, yoff, cell, sz);
+        ImDrawList* bg = ImGui::GetBackgroundDrawList();
+        ImVec2 vp0 = ImGui::GetMainViewport()->Pos;
+    ImVec2 vp1 = ImVec2(vp0.x + ImGui::GetMainViewport()->Size.x, vp0.y + ImGui::GetMainViewport()->Size.y);
+        ImU32 grad1 = IM_COL32(220, 200, 255, 255); // light purple
+        ImU32 grad2 = IM_COL32(180, 140, 255, 255); // deeper purple
+        // Left of maze (after sidebar)
+        bg->AddRectFilledMultiColor(
+            ImVec2(vp0.x + sidebarWidth, vp0.y), ImVec2(xoff, vp1.y),
+            grad1, grad1, grad2, grad2);
+        // Right of maze
+        bg->AddRectFilledMultiColor(
+            ImVec2(xoff + sz, vp0.y), ImVec2(vp1.x, vp1.y),
+            grad2, grad2, grad1, grad1);
+        // Top of maze
+        bg->AddRectFilledMultiColor(
+            ImVec2(xoff, vp0.y), ImVec2(xoff + sz, yoff),
+            grad1, grad2, grad1, grad2);
+        // Bottom of maze
+        bg->AddRectFilledMultiColor(
+            ImVec2(xoff, yoff + sz), ImVec2(xoff + sz, vp1.y),
+            grad2, grad1, grad2, grad1);
 
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -1064,6 +1170,7 @@ int main()
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+    deleteAllTextures();
     glfwDestroyWindow(gWindow);
     glfwTerminate();
     logf("Exited cleanly");
