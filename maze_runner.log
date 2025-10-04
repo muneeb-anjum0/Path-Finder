@@ -1,4 +1,21 @@
-Maze Runner log started Wed Oct  1 01:36:48 2025
+Maze Runner log started Sat Oct  4 23:33:26 2025
 
-[DEBUG] ImGui context created
-[DEBUG] Sidebar font loaded successfully
+Successfully loaded font from: assets/font/DectoneRegular-q2VG6.ttf
+Custom font set as default successfully
+Loaded texture assets/background.png (1024x1024)
+Loaded texture assets/start.png (64x64)
+Loaded texture assets/end.png (64x64)
+Loaded texture assets/obsticle.png (64x64)
+Loaded texture assets/lineHori.png (128x8)
+Loaded texture assets/lineVerti.png (8x128)
+Loaded texture assets/play.png (48x48)
+Loaded texture assets/pause.png (48x48)
+Loaded texture assets/regen.png (48x48)
+Loaded texture assets/setting.png (48x48)
+Loaded texture assets/step.png (48x48)
+Start: (0,0), End: (19,19)
+Start: (0,0), End: (23,0)
+Applied size C=24 R=20
+Start: (0,0), End: (23,23)
+Applied size C=24 R=24
+Exited cleanly
